@@ -6,6 +6,7 @@ use std::fs;
 use std::os::fd::AsRawFd as _;
 use std::path;
 use std::process;
+use std::process::ExitStatus;
 
 use nix::fcntl;
 
@@ -143,10 +144,10 @@ fn main() {
         pkg_check("flex");
         pkg_check("bison");
         pkg_check("gawk");
+        pkg_check("aclocal");
     }
 
     let (compiler, mut cflags) = if vendored_libbpf || vendored_libelf || vendored_zlib {
-        pkg_check("make");
         pkg_check("pkg-config");
 
         let compiler = cc::Build::new().try_get_compiler().expect(
@@ -200,45 +201,74 @@ fn main() {
     }
 }
 
-fn make_zlib(compiler: &cc::Tool, src_dir: &path::Path, out_dir: &path::Path) {
+fn make_zlib(compiler: &cc::Tool, src_dir: &path::Path, _: &path::Path) {
     // lock README such that if two crates are trying to compile
     // this at the same time (eg libbpf-rs libbpf-cargo)
     // they wont trample each other
-    let file = std::fs::File::open(src_dir.join("zlib/README")).unwrap();
-    let fd = file.as_raw_fd();
-    fcntl::flock(fd, fcntl::FlockArg::LockExclusive).unwrap();
+    let project_dir = src_dir.join("zlib");
 
-    let status = process::Command::new("./configure")
-        .arg("--static")
-        .arg("--prefix")
-        .arg(".")
-        .arg("--libdir")
-        .arg(out_dir)
-        .env("CC", compiler.path())
-        .env("CFLAGS", compiler.cflags_env())
-        .current_dir(&src_dir.join("zlib"))
-        .status()
-        .expect("could not execute make");
+    let file = std::fs::File::open(project_dir.join("README")).unwrap();
+    let _lock = fcntl::Flock::lock(file, fcntl::FlockArg::LockExclusive).unwrap();
 
-    assert!(status.success(), "make failed");
+    let project_dir = project_dir.to_str().unwrap();
 
-    let status = process::Command::new("make")
-        .arg("install")
-        .arg("-j")
-        .arg(&format!("{}", num_cpus()))
-        .current_dir(&src_dir.join("zlib"))
-        .status()
-        .expect("could not execute make");
+    let zlib_sources = [
+        "adler32.c",
+        "compress.c",
+        "crc32.c",
+        "deflate.c",
+        "gzclose.c",
+        "gzlib.c",
+        "gzread.c",
+        "gzwrite.c",
+        "infback.c",
+        "inffast.c",
+        "inflate.c",
+        "inftrees.c",
+        "trees.c",
+        "uncompr.c",
+        "zutil.c",
+    ];
 
-    assert!(status.success(), "make failed");
+    // These flags are only used in Android
+    // ref: https://android.googlesource.com/platform/external/zlib/+/refs/tags/android-11.0.0_r48/Android.bp
+    let android_cflags = [
+        // We do support hidden visibility, so turn that on.
+        "-DHAVE_HIDDEN",
+        // We do support const, so turn that on.
+        "-DZLIB_CONST",
+        // Enable -O3 as per chromium.
+        "-O3",
+        // "-Wall",
+        // "-Werror",
+        // "-Wno-deprecated-non-prototype",
+        // "-Wno-unused",
+        // "-Wno-unused-parameter",
+    ];
 
-    let status = process::Command::new("make")
-        .arg("distclean")
-        .current_dir(&src_dir.join("zlib"))
-        .status()
-        .expect("could not execute make");
+    configure(project_dir, vec![]);
 
-    assert!(status.success(), "make failed");
+    let mut builder = cc::Build::new();
+
+    builder.include(project_dir).files({
+        zlib_sources
+            .iter()
+            .map(|source| format!("{project_dir}/{source}"))
+    });
+
+    if build_android() {
+        for flag in android_cflags {
+            builder.flag(flag);
+        }
+    } else {
+        for flag in compiler.args() {
+            builder.flag(flag);
+        }
+    }
+
+    builder.flag_if_supported("-w").warnings(false).compile("z");
+
+    emit_rerun_directives_for_contents(&src_dir);
 }
 
 fn make_elfutils(compiler: &cc::Tool, src_dir: &path::Path, out_dir: &path::Path) {
@@ -360,9 +390,44 @@ fn num_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, |count| count.get())
 }
 
-
 fn build_android() -> bool {
     env::var("CARGO_CFG_TARGET_OS")
-            .expect("CARGO_CFG_TARGET_OS not set")
-            .eq("android")
+        .expect("CARGO_CFG_TARGET_OS not set")
+        .eq("android")
+}
+
+fn configure<'a, P, A>(project_dir: P, args: A)
+where
+    P: AsRef<str>,
+    A: IntoIterator<Item = &'a str>,
+{
+    let project_dir = project_dir.as_ref();
+
+    let prog = format!("{project_dir}/configure");
+
+    unsafe {
+        let prog = std::ffi::CString::new(prog.as_bytes()).unwrap();
+        nix::libc::chmod(prog.as_ptr(), 0o755);
+    }
+
+    let status = subproc(prog, project_dir, args);
+
+    assert!(
+        status.success(),
+        "configure({}) failed: {}",
+        project_dir,
+        status
+    );
+}
+
+fn subproc<'a, P, A>(prog: P, workdir: &str, args: A) -> ExitStatus
+where
+    P: AsRef<str>,
+    A: IntoIterator<Item = &'a str>,
+{
+    process::Command::new(prog.as_ref())
+        .current_dir(workdir)
+        .args(args)
+        .status()
+        .expect(&format!("could not execute `{}`", prog.as_ref()))
 }
