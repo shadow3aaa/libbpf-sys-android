@@ -4,10 +4,18 @@ use std::env;
 use std::ffi;
 use std::fs::read_dir;
 use std::path;
+use std::path::Path;
 use std::process;
 use std::process::ExitStatus;
 
 use nix::fcntl;
+
+fn emit_rerun_directives_for_contents(dir: &Path) {
+    for result in read_dir(dir).unwrap() {
+        let file = result.unwrap();
+        println!("cargo:rerun-if-changed={}", file.path().display());
+    }
+}
 
 #[cfg(feature = "bindgen")]
 fn generate_bindings(src_dir: path::PathBuf) {
